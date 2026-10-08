@@ -185,7 +185,25 @@ final class Model {
 // メニューバーの画像。macOS 26 のメニューバーは文字色を無視して単色にするので、
 // 色付きのゲージを出すには isTemplate=false の画像を描くしかない。
 // 文字色は描画時に解決される labelColor を使い、明るい/暗いメニューバーの両方に追従させる。
-func statusImage(_ m: Model) -> NSImage {
+// ゲーミングモードの演出の状態。load は CPU 使用率をなめらかにしたもの（0〜1）
+struct Effects {
+    var on = false
+    var load = 0.0
+    var phase = 0.0 // 虹色のずれ（0〜1 で一周）
+    var time = 0.0
+}
+
+// 横方向に色相が一周する虹色のグラデーション。phase で全体をずらす
+func rainbow(_ phase: Double, alpha: CGFloat, saturation: CGFloat = 0.85, brightness: CGFloat = 1) -> NSGradient {
+    let n = 7
+    let colors = (0..<n).map { i -> NSColor in
+        let h = (phase + Double(i) / Double(n - 1)).truncatingRemainder(dividingBy: 1)
+        return NSColor(hue: CGFloat(h), saturation: saturation, brightness: brightness, alpha: alpha)
+    }
+    return NSGradient(colors: colors)!
+}
+
+func statusImage(_ m: Model, _ fx: Effects = Effects()) -> NSImage {
     let labelFont = NSFont.systemFont(ofSize: 8, weight: .semibold)
     let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
     let netFont = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium)
@@ -200,47 +218,107 @@ func statusImage(_ m: Model) -> NSImage {
     let arrowW = width("↓", netFont) + 1
     let rateW = width("1000 Mbps", netFont)
     let netW = arrowW + rateW
-    let size = NSSize(width: gaugeW * 2 + spacing * 2 + netW, height: height)
+    // ゲーミングモードでは背景の光を見せるため左右に余白を取る
+    let pad: CGFloat = fx.on ? 5 : 0
+    let size = NSSize(width: gaugeW * 2 + spacing * 2 + netW + pad * 2, height: height)
 
     let cpu = m.cpu.total, mem = m.mem?.ratio ?? 0, rx = m.rx, tx = m.tx
     let img = NSImage(size: size, flipped: false) { _ in
-        func gauge(x: CGFloat, ratio: Double, label: String) {
+        if fx.on { drawGamingBackground(size: size, fx: fx) }
+        // 80% を超えたら脈打ち、90% を超えたら中身を小刻みに震わせる
+        let shake = max(0, (fx.load - 0.9) / 0.1)
+        let t = NSAffineTransform()
+        t.translateX(by: pad + CGFloat.random(in: -1...1) * shake * 1.2,
+                     yBy: CGFloat.random(in: -1...1) * shake * 0.8)
+        t.concat()
+
+        func bar(x: CGFloat, ratio: Double) {
             let track = NSRect(x: x, y: (height - barH) / 2, width: barW, height: barH)
             NSColor.tertiaryLabelColor.setFill()
             NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
             var fill = track
             fill.size.height = max(1.5, barH * CGFloat(min(max(ratio, 0), 1)))
-            levelColor(ratio).setFill()
-            NSBezierPath(roundedRect: fill, xRadius: 1.5, yRadius: 1.5).fill()
-
-            let tx = x + barW + gap
-            NSAttributedString(string: label, attributes: [
-                .font: labelFont, .foregroundColor: NSColor.labelColor.withAlphaComponent(0.75),
-            ]).draw(at: NSPoint(x: tx, y: 11))
-            NSAttributedString(string: "\(Int((ratio * 100).rounded()))%", attributes: [
-                .font: valueFont, .foregroundColor: NSColor.labelColor,
-            ]).draw(at: NSPoint(x: tx, y: -0.5))
+            let fillPath = NSBezierPath(roundedRect: fill, xRadius: 1.5, yRadius: 1.5)
+            if fx.on {
+                // ゲージの中身も縦方向に虹色を流す
+                rainbow(fx.phase + Double(x) / 100, alpha: 1).draw(in: fillPath, angle: 90)
+            } else {
+                levelColor(ratio).setFill()
+                fillPath.fill()
+            }
         }
-        gauge(x: 0, ratio: cpu, label: "CPU")
-        gauge(x: gaugeW + spacing, ratio: mem, label: "MEM")
+        bar(x: 0, ratio: cpu)
+        bar(x: gaugeW + spacing, ratio: mem)
 
         let nx = (gaugeW + spacing) * 2
         let right = NSMutableParagraphStyle()
         right.alignment = .right
-        func line(y: CGFloat, arrow: String, color: NSColor, rate: Double) {
-            NSAttributedString(string: arrow, attributes: [.font: netFont, .foregroundColor: color])
-                .draw(at: NSPoint(x: nx, y: y))
-            NSAttributedString(string: formatMbps(rate), attributes: [
-                .font: netFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: right,
-            ]).draw(in: NSRect(x: nx + arrowW, y: y, width: rateW, height: 12))
+        func drawTexts() {
+            for (x, ratio, label) in [(CGFloat(0), cpu, "CPU"), (gaugeW + spacing, mem, "MEM")] {
+                let tx = x + barW + gap
+                NSAttributedString(string: label, attributes: [
+                    .font: labelFont, .foregroundColor: NSColor.labelColor.withAlphaComponent(0.75),
+                ]).draw(at: NSPoint(x: tx, y: 11))
+                NSAttributedString(string: "\(Int((ratio * 100).rounded()))%", attributes: [
+                    .font: valueFont, .foregroundColor: NSColor.labelColor,
+                ]).draw(at: NSPoint(x: tx, y: -0.5))
+            }
+            for (y, arrow, color, rate) in [(CGFloat(10.5), "↑", upColor, tx), (-0.5, "↓", downColor, rx)] {
+                NSAttributedString(string: arrow, attributes: [.font: netFont, .foregroundColor: color])
+                    .draw(at: NSPoint(x: nx, y: y))
+                NSAttributedString(string: formatMbps(rate), attributes: [
+                    .font: netFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: right,
+                ]).draw(in: NSRect(x: nx + arrowW, y: y, width: rateW, height: 12))
+            }
         }
-        line(y: 10.5, arrow: "↑", color: upColor, rate: tx)
-        line(y: -0.5, arrow: "↓", color: downColor, rate: rx)
+
+        guard fx.on, let ctx = NSGraphicsContext.current?.cgContext else {
+            drawTexts()
+            return true
+        }
+        // ゲーミングモードでは、文字を透明レイヤーに描いてから文字の形だけに虹色を流し込む（.sourceIn）。
+        // 背景と同じ色が重なると文字が消えるので、色相を半周ずらした補色にする。
+        // 影はレイヤー全体に付け、背景が濃くなっても文字が埋もれないようにする
+        let dark = NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        ctx.saveGState()
+        let shadow = NSShadow()
+        shadow.shadowColor = (dark ? NSColor.black : NSColor.white).withAlphaComponent(0.5 + 0.5 * fx.load)
+        shadow.shadowBlurRadius = 1.5
+        shadow.shadowOffset = .zero
+        shadow.set()
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        drawTexts()
+        ctx.setBlendMode(.sourceIn)
+        rainbow(fx.phase + 0.5, alpha: 1, saturation: dark ? 0.35 : 0.9, brightness: dark ? 1 : 0.45)
+            .draw(in: NSRect(x: -pad, y: 0, width: size.width, height: height), angle: 0)
+        ctx.endTransparencyLayer()
+        ctx.restoreGState()
         return true
     }
     img.isTemplate = false
     img.accessibilityDescription = "CPU \(Int(cpu * 100))%、メモリ \(Int(mem * 100))%、受信 \(formatMbps(rx))、送信 \(formatMbps(tx))"
     return img
+}
+
+// 負荷が上がるほど濃く、速く流れる虹色の背景。80% を超えると縁が脈打って光る
+func drawGamingBackground(size: NSSize, fx: Effects) {
+    let rect = NSRect(x: 0.75, y: 1.5, width: size.width - 1.5, height: size.height - 3)
+    let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+    let hot = max(0, (fx.load - 0.8) / 0.2)
+    // 脈打つ速さも負荷に比例させる（80% で毎秒2回、100% で毎秒8回）
+    let pulse = hot > 0 ? 0.5 + 0.5 * sin(fx.time * 2 * .pi * (2 + 6 * hot)) : 0
+    let alpha = CGFloat(0.12 + 0.5 * fx.load + 0.2 * hot * pulse)
+    let dark = NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    // 色相が補色でも明るさが近いと文字が読めないので、文字（淡い色）より背景を暗くしておく
+    rainbow(fx.phase, alpha: alpha, brightness: dark ? 0.72 : 1).draw(in: path, angle: 0)
+
+    guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+    let edge = 0.25 + 0.75 * fx.load
+    ctx.saveGState()
+    ctx.addPath(path.cgPath.copy(strokingWithWidth: 1 + 1.5 * hot, lineCap: .round, lineJoin: .round, miterLimit: 1))
+    ctx.clip()
+    rainbow(fx.phase + 0.5, alpha: CGFloat(edge * (hot > 0 ? 0.6 + 0.4 * pulse : 0.6))).draw(in: rect, angle: 0)
+    ctx.restoreGState()
 }
 
 // メニューを開いたときの詳細表示（数値の内訳と直近2分のグラフ）
@@ -344,6 +422,10 @@ final class App: NSObject, NSApplicationDelegate {
     let model = Model()
     var detail: DetailView!
     var loginItem: NSMenuItem!
+    var gamingItem: NSMenuItem!
+    var fx = Effects()
+    var fxTimer: Timer?
+    var lastFrame = 0.0, lastRender = 0.0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 二重起動するとメニューバーに2つ並ぶので、後から起動した方は終了する
@@ -362,12 +444,15 @@ final class App: NSObject, NSApplicationDelegate {
         menu.addItem(detailItem)
         menu.addItem(.separator())
         menu.addItem(withTitle: "アクティビティモニタを開く", action: #selector(openActivityMonitor), keyEquivalent: "").target = self
+        gamingItem = menu.addItem(withTitle: "ゲーミングモード", action: #selector(toggleGaming), keyEquivalent: "")
+        gamingItem.target = self
         loginItem = menu.addItem(withTitle: "ログイン時に起動", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
         updateLoginState()
+        setGaming(UserDefaults.standard.bool(forKey: "gamingMode"))
 
         tick()
         // メニューを開いている間（イベントトラッキング中）も更新が止まらないよう .common に載せる
@@ -377,8 +462,43 @@ final class App: NSObject, NSApplicationDelegate {
 
     func tick() {
         model.update()
-        item.button?.image = statusImage(model)
+        // ゲーミングモード中はアニメーション側で毎フレーム描く
+        if !fx.on { item.button?.image = statusImage(model) }
         detail.needsDisplay = true
+    }
+
+    @objc func toggleGaming() {
+        setGaming(!fx.on)
+        UserDefaults.standard.set(fx.on, forKey: "gamingMode")
+    }
+
+    func setGaming(_ on: Bool) {
+        fx.on = on
+        gamingItem.state = on ? .on : .off
+        fxTimer?.invalidate()
+        fxTimer = nil
+        if on {
+            lastFrame = ProcessInfo.processInfo.systemUptime
+            let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.frame() }
+            RunLoop.main.add(t, forMode: .common)
+            fxTimer = t
+        } else {
+            item.button?.image = statusImage(model)
+        }
+    }
+
+    // 30fps で回し、負荷に応じて描き直す頻度を変える（暇なときは毎秒8回、全開で毎秒30回）。
+    // 1秒ごとの計測値の間はなめらかに補間して、色の流れが急に変わらないようにする
+    func frame() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = now - lastFrame
+        lastFrame = now
+        fx.load += (model.cpu.total - fx.load) * min(1, dt * 2.5)
+        fx.phase = (fx.phase + dt * (0.04 + 1.6 * pow(fx.load, 1.5))).truncatingRemainder(dividingBy: 1)
+        fx.time = now
+        guard now - lastRender >= 1 / (8 + 22 * fx.load) - 0.001 else { return }
+        lastRender = now
+        item.button?.image = statusImage(model, fx)
     }
 
     @objc func openActivityMonitor() {
